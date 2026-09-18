@@ -1,6 +1,14 @@
 import { defineStore } from 'pinia';
 import { ref, computed } from 'vue';
-import type { ECGLead, HRVData, RPeak, ArrhythmiaEvent, ECGAnalysisResponse } from '../types';
+import type {
+  ECGLead,
+  HRVData,
+  RPeak,
+  ArrhythmiaEvent,
+  AnalysisResult,
+  AnalysisSource,
+  ECGAnalysisResponse,
+} from '../types';
 
 // Gaussian function for PQRST wave simulation
 function gaussian(x: number, amplitude: number, center: number, width: number): number {
@@ -43,6 +51,30 @@ function generatePQRSTCycle(tNorm: number, config: LeadConfig): number {
   return p + q + r + s + tWave + st;
 }
 
+/** 心率滑条停止拖动后多久才发起一次分析 */
+const HEART_RATE_DEBOUNCE_MS = 400;
+/** 后端请求超时时间 */
+const BACKEND_TIMEOUT_MS = 8000;
+
+/**
+ * 由同一份事件列表派生统一的诊断文案。
+ * 状态栏与事件面板都以此为准，保证两处口径一致。
+ */
+function buildDiagnosis(events: ArrhythmiaEvent[], hrv: HRVData): string {
+  const types = new Set(events.map((e) => e.eventType));
+
+  if (types.has('st_elevation')) return 'ST 段抬高 - 建议立即就医检查';
+  if (types.has('tachycardia') && types.has('atrial_fibrillation')) return '快速房颤 - 建议进一步心脏评估';
+  if (types.has('tachycardia')) return '窦性心动过速 - 请结合临床症状判断';
+  if (types.has('bradycardia')) return '窦性心动过缓 - 建议关注心率变化';
+  if (types.has('atrial_fibrillation')) return '心律不规则 - 疑似房颤，建议 Holter 监测';
+
+  const pvc = events.find((e) => e.eventType === 'premature_ventricular_contraction');
+  if (pvc) return pvc.description;
+
+  return `正常窦性心律 | HR: ${hrv.heartRate.toFixed(0)} BPM | SDNN: ${hrv.sdnn.toFixed(1)} ms`;
+}
+
 export const useECGStore = defineStore('ecg', () => {
   // State
   const selectedLead = ref<string>('II');
@@ -57,9 +89,22 @@ export const useECGStore = defineStore('ecg', () => {
   const isLoading = ref<boolean>(false);
   const useBackend = ref<boolean>(false);
   const backendUrl = ref<string>('http://localhost:8000');
+  /** 当前页面上这份结果的计算来源（本地 / 后端），null 表示尚未分析 */
+  const analysisSource = ref<AnalysisSource | null>(null);
+  /** 最近一次成功提交的分析批次号，用于列表 key */
+  const lastRunId = ref<number>(0);
+  /** 后端不可用时的错误信息；非空时界面弹窗展示 */
+  const backendError = ref<string | null>(null);
 
   let animationTimer: ReturnType<typeof setInterval> | null = null;
   let scrollOffset = ref<number>(0);
+
+  // 并发控制：单调递增的分析批次号，只有最新一轮允许提交结果
+  let runSeq = 0;
+  // 当前在飞的后端请求，可在新一轮分析开始时中止
+  let activeController: AbortController | null = null;
+  // 心率滑条的防抖计时器
+  let hrDebounceTimer: ReturnType<typeof setTimeout> | null = null;
 
   // Getters
   const currentSamples = computed(() => ecgData.value?.samples ?? []);
@@ -76,7 +121,6 @@ export const useECGStore = defineStore('ecg', () => {
     const samples: number[] = new Array(totalSamples);
     const config = LEAD_CONFIGS[selectedLead.value] || LEAD_CONFIGS['II'];
     const cycleDuration = 60.0 / heartRate.value;
-    const samplesPerCycle = Math.floor(cycleDuration * samplingRate.value);
 
     for (let i = 0; i < totalSamples; i++) {
       const time = i / samplingRate.value;
@@ -112,7 +156,6 @@ export const useECGStore = defineStore('ecg', () => {
     const minDistance = Math.floor(0.2 * sr); // 200ms minimum between peaks
 
     // Simple moving average for baseline
-    const windowSize = Math.floor(0.15 * sr);
     const threshold = samples.reduce((a, b) => a + b, 0) / samples.length;
     const stdDev = Math.sqrt(
       samples.reduce((sum, s) => sum + (s - threshold) ** 2, 0) / samples.length
@@ -259,78 +302,165 @@ export const useECGStore = defineStore('ecg', () => {
   }
 
   /**
-   * Run full ECG analysis (frontend simulation)
+   * 本地完整分析（前端模拟），产出一份原子结果
    */
-  async function analyzeECG() {
-    isLoading.value = true;
+  function runLocalAnalysis(runId: number): AnalysisResult {
+    const lead = generateECGWaveform();
+    lead.rPeaks = detectRPeaks(lead.samples, lead.samplingRate);
 
-    if (useBackend.value) {
-      // Use backend API
-      try {
-        const response = await fetch(`${backendUrl.value}/ecg/analyze`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            lead_name: selectedLead.value,
-            duration: duration.value,
-            sampling_rate: samplingRate.value,
-            heart_rate: heartRate.value,
-          }),
-        });
-        const data: ECGAnalysisResponse = await response.json();
-        ecgData.value = {
-          leadName: data.lead.lead_name,
-          samplingRate: data.lead.sampling_rate,
-          duration: data.lead.duration,
-          samples: data.lead.samples,
-          rPeaks: data.lead.r_peaks.map((rp: any) => ({
-            index: rp.index,
-            time: rp.time,
-            amplitude: rp.amplitude,
-          })),
-        };
-        hrvData.value = {
-          heartRate: data.hrv.heart_rate,
-          sdnn: data.hrv.sdnn,
-          rmssd: data.hrv.rmssd,
-          pnn50: data.hrv.pnn50,
-          nnIntervals: data.hrv.nn_intervals,
-        };
-        arrhythmiaEvents.value = data.arrhythmia_events.map((evt: any) => ({
-          eventType: evt.event_type,
-          confidence: evt.confidence,
-          description: evt.description,
-          timestamp: evt.timestamp,
-        }));
-        rhythmDiagnosis.value = data.rhythm_diagnosis;
-      } catch (error) {
-        console.error('Backend API error:', error);
-        // Fallback to frontend simulation
-        runFrontendAnalysis();
-      }
-    } else {
-      runFrontendAnalysis();
-    }
+    const hrv = calculateHRV(lead.rPeaks, lead.samplingRate);
+    const events = detectArrhythmias(hrv, lead.rPeaks, lead.samples, lead.samplingRate);
 
-    isLoading.value = false;
+    return {
+      lead,
+      hrv,
+      events,
+      diagnosis: buildDiagnosis(events, hrv),
+      source: 'local',
+      runId,
+    };
   }
 
-  function runFrontendAnalysis() {
-    const lead = generateECGWaveform();
-    const peaks = detectRPeaks(lead.samples, lead.samplingRate);
-    lead.rPeaks = peaks;
-    ecgData.value = lead;
+  /**
+   * 调用后端 /ecg/analyze，带超时；网络错误 / 非 2xx / 超时都会抛出
+   */
+  async function requestBackendAnalysis(signal: AbortSignal): Promise<ECGAnalysisResponse> {
+    const timeoutController = new AbortController();
+    const onAbort = () => timeoutController.abort();
+    signal.addEventListener('abort', onAbort);
+    let timedOut = false;
+    const timer = setTimeout(() => {
+      timedOut = true;
+      timeoutController.abort();
+    }, BACKEND_TIMEOUT_MS);
 
-    const hrv = calculateHRV(peaks, lead.samplingRate);
-    hrvData.value = hrv;
+    let response: Response;
+    try {
+      response = await fetch(`${backendUrl.value}/ecg/analyze`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          lead_name: selectedLead.value,
+          duration: duration.value,
+          sampling_rate: samplingRate.value,
+          heart_rate: heartRate.value,
+        }),
+        signal: timeoutController.signal,
+      });
+    } catch (error) {
+      if (timedOut) {
+        throw new Error(`请求超时（${BACKEND_TIMEOUT_MS / 1000}s 无响应），服务可能已启动但响应过慢或地址不可达`);
+      }
+      throw error;
+    } finally {
+      clearTimeout(timer);
+      signal.removeEventListener('abort', onAbort);
+    }
 
-    const events = detectArrhythmias(hrv, peaks, lead.samples, lead.samplingRate);
-    arrhythmiaEvents.value = events;
+    if (!response.ok) {
+      throw new Error(`服务返回异常：HTTP ${response.status}${response.statusText ? ` ${response.statusText}` : ''}`);
+    }
+    return (await response.json()) as ECGAnalysisResponse;
+  }
 
-    const isNormal = events.some(e => e.eventType === 'normal');
-    rhythmDiagnosis.value = isNormal
-      ? `正常窦性心律 | HR: ${hrv.heartRate.toFixed(0)} BPM | SDNN: ${hrv.sdnn.toFixed(1)} ms`
-      : events.map(e => e.description).join(' | ');
+  function mapBackendResult(data: ECGAnalysisResponse, runId: number): AnalysisResult {
+    return {
+      lead: {
+        leadName: data.lead.lead_name,
+        samplingRate: data.lead.sampling_rate,
+        duration: data.lead.duration,
+        samples: data.lead.samples,
+        rPeaks: data.lead.r_peaks.map((rp) => ({
+          index: rp.index,
+          time: rp.time,
+          amplitude: rp.amplitude,
+        })),
+      },
+      hrv: {
+        heartRate: data.hrv.heart_rate,
+        sdnn: data.hrv.sdnn,
+        rmssd: data.hrv.rmssd,
+        pnn50: data.hrv.pnn50,
+        nnIntervals: data.hrv.nn_intervals,
+      },
+      events: data.arrhythmia_events.map((evt) => ({
+        eventType: evt.event_type,
+        confidence: evt.confidence,
+        description: evt.description,
+        timestamp: evt.timestamp,
+      })),
+      diagnosis: data.rhythm_diagnosis,
+      source: 'backend',
+      runId,
+    };
+  }
+
+  /**
+   * 原子提交：波形 / HRV / 事件 / 诊断 / 来源一次性来自同一轮结果，
+   * 杜绝晚到的响应分多次覆盖，保证状态栏与事件面板同源。
+   */
+  function commitResult(result: AnalysisResult) {
+    ecgData.value = result.lead;
+    hrvData.value = result.hrv;
+    arrhythmiaEvents.value = result.events;
+    rhythmDiagnosis.value = result.diagnosis;
+    analysisSource.value = result.source;
+    lastRunId.value = result.runId;
+    backendError.value = null;
+  }
+
+  function formatBackendError(error: unknown): string {
+    const detail = error instanceof Error ? error.message : String(error);
+    return `无法连接后端分析服务（${backendUrl.value}）。\n请确认 FastAPI 服务已启动、地址与端口正确，或改用本地分析。\n\n技术信息：${detail}`;
+  }
+
+  function cancelHeartRateDebounce() {
+    if (hrDebounceTimer) {
+      clearTimeout(hrDebounceTimer);
+      hrDebounceTimer = null;
+    }
+  }
+
+  /**
+   * Run full ECG analysis.
+   * 单飞 + 最新生效：每发起一次就作废旧一轮（中止其在飞请求），
+   * 只有最新一轮的结果允许提交。后端不可用时不静默降级，弹窗报错。
+   */
+  async function analyzeECG(): Promise<void> {
+    cancelHeartRateDebounce();
+
+    const runId = ++runSeq;
+    activeController?.abort();
+    const controller = new AbortController();
+    activeController = controller;
+    isLoading.value = true;
+
+    const isStale = () => runSeq !== runId;
+
+    try {
+      if (useBackend.value) {
+        let data: ECGAnalysisResponse;
+        try {
+          data = await requestBackendAnalysis(controller.signal);
+        } catch (error) {
+          // 被更新的一轮取代：静默丢弃
+          if (isStale() || controller.signal.aborted) return;
+          backendError.value = formatBackendError(error);
+          return;
+        }
+        if (isStale()) return;
+        commitResult(mapBackendResult(data, runId));
+      } else {
+        const result = runLocalAnalysis(runId);
+        if (isStale()) return;
+        commitResult(result);
+      }
+    } finally {
+      if (!isStale()) {
+        isLoading.value = false;
+        activeController = null;
+      }
+    }
   }
 
   /**
@@ -341,8 +471,9 @@ export const useECGStore = defineStore('ecg', () => {
     analyzeECG();
     animationTimer = setInterval(() => {
       scrollOffset.value += 5;
-      // Regenerate data every full cycle
-      if (scrollOffset.value >= currentSamples.value.length) {
+      // Regenerate data every full cycle；ecgData 尚未就绪时等待首轮结果，避免空转连发
+      const totalLength = ecgData.value?.samples.length ?? 0;
+      if (totalLength > 0 && scrollOffset.value >= totalLength) {
         scrollOffset.value = 0;
         analyzeECG();
       }
@@ -354,6 +485,7 @@ export const useECGStore = defineStore('ecg', () => {
    */
   function stopMonitoring() {
     isMonitoring.value = false;
+    cancelHeartRateDebounce();
     if (animationTimer) {
       clearInterval(animationTimer);
       animationTimer = null;
@@ -364,6 +496,7 @@ export const useECGStore = defineStore('ecg', () => {
    * Select a different ECG lead
    */
   function selectLead(lead: string) {
+    if (selectedLead.value === lead) return;
     selectedLead.value = lead;
     if (isMonitoring.value) {
       analyzeECG();
@@ -371,13 +504,50 @@ export const useECGStore = defineStore('ecg', () => {
   }
 
   /**
-   * Update heart rate setting
+   * Update heart rate setting.
+   * 监测中拖动滑条只更新数值，停下（400ms 内无新输入）后只分析一次。
    */
   function setHeartRate(hr: number) {
     heartRate.value = hr;
-    if (isMonitoring.value) {
-      analyzeECG();
+    if (!isMonitoring.value) return;
+
+    cancelHeartRateDebounce();
+    hrDebounceTimer = setTimeout(() => {
+      hrDebounceTimer = null;
+      if (isMonitoring.value) {
+        analyzeECG();
+      }
+    }, HEART_RATE_DEBOUNCE_MS);
+  }
+
+  /**
+   * 切换“使用后端 API”。打开后立即按后端口径分析一次；
+   * 连不上则弹窗（不会静默用本地结果冒充后端结果），开关保持用户选择。
+   */
+  async function setUseBackend(enabled: boolean) {
+    if (useBackend.value === enabled) return;
+    useBackend.value = enabled;
+    if (isMonitoring.value || ecgData.value) {
+      await analyzeECG();
     }
+  }
+
+  /** 关闭后端错误弹窗（保留当前页面上已有的分析结果与开关状态） */
+  function dismissBackendError() {
+    backendError.value = null;
+  }
+
+  /** 弹窗入口：重试后端分析 */
+  async function retryBackendAnalysis(): Promise<void> {
+    backendError.value = null;
+    await analyzeECG();
+  }
+
+  /** 弹窗入口：本次改用本地分析，并把开关切回本地侧 */
+  async function analyzeLocallyAfterError(): Promise<void> {
+    backendError.value = null;
+    useBackend.value = false;
+    await analyzeECG();
   }
 
   return {
@@ -395,6 +565,9 @@ export const useECGStore = defineStore('ecg', () => {
     useBackend,
     backendUrl,
     scrollOffset,
+    analysisSource,
+    lastRunId,
+    backendError,
     // Getters
     currentSamples,
     currentRPeaks,
@@ -405,6 +578,10 @@ export const useECGStore = defineStore('ecg', () => {
     stopMonitoring,
     selectLead,
     setHeartRate,
+    setUseBackend,
+    dismissBackendError,
+    retryBackendAnalysis,
+    analyzeLocallyAfterError,
     generateECGWaveform,
     detectRPeaks,
     calculateHRV,

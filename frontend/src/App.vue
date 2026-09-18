@@ -72,7 +72,8 @@
         <label class="flex items-center gap-2 text-sm text-gray-300 cursor-pointer">
           <input
             type="checkbox"
-            v-model="store.useBackend"
+            :checked="store.useBackend"
+            @change="store.setUseBackend(($event.target as HTMLInputElement).checked)"
             class="w-4 h-4 rounded accent-emerald-500"
           />
           使用后端 API
@@ -134,8 +135,22 @@
             导联: <span class="text-emerald-400 font-medium">{{ store.selectedLead }}</span>
           </span>
         </div>
-        <div class="text-sm text-gray-400">
-          诊断: <span class="text-cyan-300">{{ store.rhythmDiagnosis || '等待分析...' }}</span>
+        <div class="text-sm text-gray-400 flex items-center gap-2">
+          <span>
+            诊断: <span class="text-cyan-300">{{ store.rhythmDiagnosis || '等待分析...' }}</span>
+          </span>
+          <span
+            v-if="store.analysisSource"
+            :class="[
+              'inline-block text-xs px-1.5 py-0.5 rounded border',
+              store.analysisSource === 'backend'
+                ? 'bg-indigo-500/15 text-indigo-300 border-indigo-500/40'
+                : 'bg-gray-700/40 text-gray-300 border-gray-600/50',
+            ]"
+            :title="store.analysisSource === 'backend' ? '当前结果由后端分析服务计算' : '当前结果由浏览器本地模拟计算'"
+          >
+            {{ store.analysisSource === 'backend' ? '后端分析' : '本地分析' }}
+          </span>
         </div>
       </div>
 
@@ -173,7 +188,7 @@
           <div v-else class="space-y-2">
             <div
               v-for="(event, idx) in store.arrhythmiaEvents"
-              :key="idx"
+              :key="`${store.lastRunId}-${event.eventType}-${idx}`"
               :class="[
                 'p-3 rounded-lg border text-sm',
                 event.eventType === 'normal'
@@ -221,6 +236,51 @@
         </div>
       </div>
     </main>
+
+    <!-- Backend Unavailable Modal -->
+    <div
+      v-if="store.backendError"
+      class="fixed inset-0 z-50 flex items-center justify-center bg-black/60"
+      @click.self="store.dismissBackendError"
+    >
+      <div class="bg-gray-900 border border-red-700/50 rounded-xl shadow-2xl w-full max-w-md mx-4 overflow-hidden">
+        <div class="flex items-center gap-2 px-5 py-3 border-b border-gray-800 bg-red-900/20">
+          <svg class="w-5 h-5 text-red-400 shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 9v2m0 4h.01M10.29 3.86L1.82 18a2 2 0 001.71 3h16.94a2 2 0 001.71-3L13.71 3.86a2 2 0 00-3.42 0z" />
+          </svg>
+          <h3 class="text-base font-semibold text-red-300">后端分析服务不可用</h3>
+        </div>
+        <div class="px-5 py-4">
+          <p class="text-sm text-gray-300 whitespace-pre-line leading-relaxed">{{ store.backendError }}</p>
+          <p class="text-xs text-gray-500 mt-3">
+            当前“使用后端 API”开关仍保持开启；不会使用本地结果冒充后端分析。
+          </p>
+        </div>
+        <div class="flex justify-end gap-2 px-5 py-3 border-t border-gray-800 bg-gray-900/60">
+          <button
+            @click="store.dismissBackendError"
+            :disabled="store.isLoading"
+            class="px-3 py-2 rounded-lg text-sm text-gray-300 bg-gray-800 hover:bg-gray-700 border border-gray-700 transition-all disabled:opacity-50 disabled:cursor-not-allowed"
+          >
+            关闭
+          </button>
+          <button
+            @click="store.analyzeLocallyAfterError"
+            :disabled="store.isLoading"
+            class="px-3 py-2 rounded-lg text-sm text-gray-200 bg-gray-700 hover:bg-gray-600 border border-gray-600 transition-all disabled:opacity-50 disabled:cursor-not-allowed"
+          >
+            改用本地分析
+          </button>
+          <button
+            @click="store.retryBackendAnalysis"
+            :disabled="store.isLoading"
+            class="px-3 py-2 rounded-lg text-sm text-white bg-emerald-600 hover:bg-emerald-500 font-medium transition-all disabled:opacity-50 disabled:cursor-not-allowed"
+          >
+            {{ store.isLoading ? '重试中...' : '重试后端' }}
+          </button>
+        </div>
+      </div>
+    </div>
   </div>
 </template>
 
