@@ -133,6 +133,22 @@
           <span class="text-sm text-gray-400">
             导联: <span class="text-emerald-400 font-medium">{{ store.selectedLead }}</span>
           </span>
+          <span class="text-xs text-gray-500">|</span>
+          <span class="text-sm text-gray-400 flex items-center gap-1.5">
+            来源:
+            <span
+              v-if="store.analysisSource"
+              :class="[
+                'text-xs px-2 py-0.5 rounded-full border',
+                store.analysisSource === 'backend'
+                  ? 'bg-emerald-500/10 text-emerald-400 border-emerald-500/30'
+                  : 'bg-amber-500/10 text-amber-400 border-amber-500/30',
+              ]"
+            >
+              {{ store.analysisSource === 'backend' ? '后端 API' : '本地模拟' }}
+            </span>
+            <span v-else class="text-xs text-gray-500">—</span>
+          </span>
         </div>
         <div class="text-sm text-gray-400">
           诊断: <span class="text-cyan-300">{{ store.rhythmDiagnosis || '等待分析...' }}</span>
@@ -173,7 +189,7 @@
           <div v-else class="space-y-2">
             <div
               v-for="(event, idx) in store.arrhythmiaEvents"
-              :key="idx"
+              :key="`${event.eventType}-${idx}`"
               :class="[
                 'p-3 rounded-lg border text-sm',
                 event.eventType === 'normal'
@@ -221,6 +237,47 @@
         </div>
       </div>
     </main>
+
+    <!-- Backend Error Dialog -->
+    <div
+      v-if="store.backendError"
+      class="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm"
+    >
+      <div class="bg-gray-900 border border-red-500/40 rounded-xl p-6 max-w-md w-full mx-4 shadow-2xl">
+        <div class="flex items-start gap-3">
+          <svg class="w-6 h-6 text-red-400 shrink-0 mt-0.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 9v2m0 4h.01M10.29 3.86L1.82 18a2 2 0 001.71 3h16.94a2 2 0 001.71-3L13.71 3.86a2 2 0 00-3.42 0z" />
+          </svg>
+          <div>
+            <h3 class="text-lg font-semibold text-red-400">后端分析服务不可用</h3>
+            <p class="text-sm text-gray-300 mt-2">{{ store.backendError }}</p>
+            <p class="text-xs text-gray-500 mt-2">
+              可重试连接后端，或切换为本地模拟分析（界面会标注数据来源）。
+            </p>
+          </div>
+        </div>
+        <div class="flex gap-2 mt-5 justify-end">
+          <button
+            @click="store.dismissBackendError()"
+            class="px-4 py-2 rounded-lg text-sm font-medium bg-gray-700 hover:bg-gray-600 text-gray-300 transition-all"
+          >
+            关闭
+          </button>
+          <button
+            @click="store.fallbackToLocalAnalysis()"
+            class="px-4 py-2 rounded-lg text-sm font-medium bg-cyan-600 hover:bg-cyan-500 text-white transition-all"
+          >
+            改用本地分析
+          </button>
+          <button
+            @click="store.retryBackendAnalysis()"
+            class="px-4 py-2 rounded-lg text-sm font-medium bg-emerald-600 hover:bg-emerald-500 text-white transition-all"
+          >
+            重试
+          </button>
+        </div>
+      </div>
+    </div>
   </div>
 </template>
 

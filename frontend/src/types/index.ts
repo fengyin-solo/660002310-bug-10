@@ -27,11 +27,42 @@ export interface ArrhythmiaEvent {
   timestamp: number;
 }
 
+// ---- Backend API wire format (FastAPI returns snake_case JSON) ----
+
+export interface ApiRPeak {
+  index: number;
+  time: number;
+  amplitude: number;
+}
+
+export interface ApiECGLead {
+  lead_name: string;
+  sampling_rate: number;
+  duration: number;
+  samples: number[];
+  r_peaks: ApiRPeak[];
+}
+
+export interface ApiHRVMetrics {
+  heart_rate: number;
+  sdnn: number;
+  rmssd: number;
+  pnn50: number;
+  nn_intervals: number[];
+}
+
+export interface ApiArrhythmiaEvent {
+  event_type: ArrhythmiaEvent['eventType'];
+  confidence: number;
+  description: string;
+  timestamp: number;
+}
+
 export interface ECGAnalysisResponse {
-  lead: ECGLead;
-  hrv: HRVData;
-  arrhythmiaEvents: ArrhythmiaEvent[];
-  rhythmDiagnosis: string;
+  lead: ApiECGLead;
+  hrv: ApiHRVMetrics;
+  arrhythmia_events: ApiArrhythmiaEvent[];
+  rhythm_diagnosis: string;
 }
 
 export interface ECGAnalysisRequest {

@@ -57,8 +57,17 @@ export const useECGStore = defineStore('ecg', () => {
   const isLoading = ref<boolean>(false);
   const useBackend = ref<boolean>(false);
   const backendUrl = ref<string>('http://localhost:8000');
+  // Source of the currently displayed analysis results
+  const analysisSource = ref<'backend' | 'local' | null>(null);
+  // Backend failure message; when set, an error dialog is shown
+  const backendError = ref<string | null>(null);
 
   let animationTimer: ReturnType<typeof setInterval> | null = null;
+  let hrDebounceTimer: ReturnType<typeof setTimeout> | null = null;
+  // Monotonic request id: only the latest request may commit its results
+  let requestSeq = 0;
+  // Aborts the in-flight backend fetch when a newer request supersedes it
+  let abortController: AbortController | null = null;
   let scrollOffset = ref<number>(0);
 
   // Getters
@@ -259,13 +268,23 @@ export const useECGStore = defineStore('ecg', () => {
   }
 
   /**
-   * Run full ECG analysis (frontend simulation)
+   * Run full ECG analysis.
+   *
+   * Concurrency model: every call invalidates the previous request
+   * (sequence bump + abort). Only the latest request commits its results,
+   * and it commits all result fields atomically, so the status bar
+   * diagnosis and the arrhythmia panel always reflect the same run.
    */
   async function analyzeECG() {
+    const seq = ++requestSeq;
+    abortController?.abort();
+    abortController = null;
     isLoading.value = true;
 
     if (useBackend.value) {
-      // Use backend API
+      const controller = new AbortController();
+      abortController = controller;
+
       try {
         const response = await fetch(`${backendUrl.value}/ecg/analyze`, {
           method: 'POST',
@@ -276,14 +295,22 @@ export const useECGStore = defineStore('ecg', () => {
             sampling_rate: samplingRate.value,
             heart_rate: heartRate.value,
           }),
+          signal: controller.signal,
         });
+        if (!response.ok) {
+          throw new Error(`后端返回错误 (HTTP ${response.status})`);
+        }
         const data: ECGAnalysisResponse = await response.json();
+
+        // A newer request was issued while this one was in flight: drop it
+        if (seq !== requestSeq) return;
+
         ecgData.value = {
           leadName: data.lead.lead_name,
           samplingRate: data.lead.sampling_rate,
           duration: data.lead.duration,
           samples: data.lead.samples,
-          rPeaks: data.lead.r_peaks.map((rp: any) => ({
+          rPeaks: data.lead.r_peaks.map((rp) => ({
             index: rp.index,
             time: rp.time,
             amplitude: rp.amplitude,
@@ -296,23 +323,54 @@ export const useECGStore = defineStore('ecg', () => {
           pnn50: data.hrv.pnn50,
           nnIntervals: data.hrv.nn_intervals,
         };
-        arrhythmiaEvents.value = data.arrhythmia_events.map((evt: any) => ({
+        arrhythmiaEvents.value = data.arrhythmia_events.map((evt) => ({
           eventType: evt.event_type,
           confidence: evt.confidence,
           description: evt.description,
           timestamp: evt.timestamp,
         }));
         rhythmDiagnosis.value = data.rhythm_diagnosis;
-      } catch (error) {
+        analysisSource.value = 'backend';
+      } catch (error: any) {
+        // Superseded or aborted requests must not touch state
+        if (controller.signal.aborted || seq !== requestSeq) return;
         console.error('Backend API error:', error);
-        // Fallback to frontend simulation
-        runFrontendAnalysis();
+        const reason =
+          error instanceof TypeError
+            ? `无法连接后端服务 (${backendUrl.value})，请确认服务已启动`
+            : error?.message ?? '未知错误';
+        backendError.value = `${reason}。当前展示的是最近一次成功分析的结果。`;
+      } finally {
+        if (seq === requestSeq) {
+          isLoading.value = false;
+        }
       }
     } else {
       runFrontendAnalysis();
+      isLoading.value = false;
     }
+  }
 
-    isLoading.value = false;
+  /**
+   * Retry the failed backend analysis (from the error dialog).
+   */
+  function retryBackendAnalysis() {
+    backendError.value = null;
+    analyzeECG();
+  }
+
+  /**
+   * Give up on the backend: switch the toggle off and analyze locally,
+   * so the UI honestly reflects where results come from.
+   */
+  function fallbackToLocalAnalysis() {
+    backendError.value = null;
+    useBackend.value = false;
+    analyzeECG();
+  }
+
+  function dismissBackendError() {
+    backendError.value = null;
   }
 
   function runFrontendAnalysis() {
@@ -331,6 +389,7 @@ export const useECGStore = defineStore('ecg', () => {
     rhythmDiagnosis.value = isNormal
       ? `正常窦性心律 | HR: ${hrv.heartRate.toFixed(0)} BPM | SDNN: ${hrv.sdnn.toFixed(1)} ms`
       : events.map(e => e.description).join(' | ');
+    analysisSource.value = 'local';
   }
 
   /**
@@ -358,6 +417,16 @@ export const useECGStore = defineStore('ecg', () => {
       clearInterval(animationTimer);
       animationTimer = null;
     }
+    if (hrDebounceTimer) {
+      clearTimeout(hrDebounceTimer);
+      hrDebounceTimer = null;
+    }
+    // Invalidate any in-flight analysis so a late response
+    // cannot overwrite state after monitoring has stopped
+    requestSeq++;
+    abortController?.abort();
+    abortController = null;
+    isLoading.value = false;
   }
 
   /**
@@ -371,13 +440,20 @@ export const useECGStore = defineStore('ecg', () => {
   }
 
   /**
-   * Update heart rate setting
+   * Update heart rate setting.
+   * The slider fires continuously while dragging; debounce so the
+   * analysis only runs once, shortly after the user stops dragging.
    */
   function setHeartRate(hr: number) {
     heartRate.value = hr;
-    if (isMonitoring.value) {
-      analyzeECG();
+    if (!isMonitoring.value) return;
+    if (hrDebounceTimer) {
+      clearTimeout(hrDebounceTimer);
     }
+    hrDebounceTimer = setTimeout(() => {
+      hrDebounceTimer = null;
+      analyzeECG();
+    }, 400);
   }
 
   return {
@@ -394,6 +470,8 @@ export const useECGStore = defineStore('ecg', () => {
     isLoading,
     useBackend,
     backendUrl,
+    analysisSource,
+    backendError,
     scrollOffset,
     // Getters
     currentSamples,
@@ -401,6 +479,9 @@ export const useECGStore = defineStore('ecg', () => {
     currentHeartRate,
     // Actions
     analyzeECG,
+    retryBackendAnalysis,
+    fallbackToLocalAnalysis,
+    dismissBackendError,
     startMonitoring,
     stopMonitoring,
     selectLead,
